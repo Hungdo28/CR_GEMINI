@@ -1,0 +1,11 @@
+# Thư viện Node.js
+node_modules/
+
+# Dữ liệu trình duyệt & cookies tài khoản (TUYỆT ĐỐI KHÔNG ĐẨY LÊN GITHUB)
+user_data/
+chrome_profile/
+
+# File tạm và log
+*.log
+.DS_Store
+.env
