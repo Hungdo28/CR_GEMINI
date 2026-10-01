@@ -69,41 +69,115 @@ async function getGeminiPage() {
     }
 
     // Đợi ô nhập liệu xuất hiện
-    await page.waitForSelector('div[contenteditable="true"]', { timeout: 30000 });
+    await page.waitForSelector('div.ql-editor, div[contenteditable="true"]', { timeout: 30000 });
     activePage = page;
     return page;
 }
 
+// Đảm bảo chọn đúng mô hình Gemini (mặc định: Flash)
+async function ensureModel(page, targetModel = 'Flash') {
+    try {
+        const switchBtn = page.locator('button.input-area-switch, button[aria-label*="chọn chế độ"], button[aria-label*="mode selector"]').first();
+        if (!await switchBtn.isVisible({ timeout: 2000 }).catch(() => false)) {
+            return false;
+        }
+
+        const currentText = (await switchBtn.innerText()).trim();
+
+        // Kiểm tra nếu đã đúng model
+        const targetLower = targetModel.toLowerCase();
+        if (targetLower === 'flash') {
+            if (currentText.toLowerCase() === 'flash' || (currentText.toLowerCase().includes('flash') && !currentText.toLowerCase().includes('lite'))) {
+                return true;
+            }
+        } else if (currentText.toLowerCase().includes(targetLower)) {
+            return true;
+        }
+
+        console.log(`[Gemini] Đang chuyển mô hình từ "${currentText}" sang "${targetModel}"...`);
+        await switchBtn.click();
+        await page.waitForTimeout(600);
+
+        const switched = await page.evaluate((target) => {
+            const items = Array.from(document.querySelectorAll('gem-menu-item, [role="menuitem"], .mat-mdc-menu-item'));
+            const tLower = target.toLowerCase();
+            let el = null;
+            if (tLower === 'flash') {
+                el = items.find(item => {
+                    const txt = (item.innerText || '').toLowerCase();
+                    return txt.includes('flash') && !txt.includes('lite');
+                });
+            } else if (tLower === 'flash-lite' || tLower === 'lite') {
+                el = items.find(item => (item.innerText || '').toLowerCase().includes('lite'));
+            } else if (tLower === 'pro') {
+                el = items.find(item => (item.innerText || '').toLowerCase().includes('pro'));
+            }
+            if (el) {
+                el.click();
+                return true;
+            }
+            return false;
+        }, targetModel);
+
+        if (switched) {
+            await page.waitForTimeout(600);
+            const newText = (await switchBtn.innerText()).trim();
+            console.log(`✓ [Gemini] Đã kích hoạt mô hình: "${newText}"`);
+            return true;
+        } else {
+            await page.keyboard.press('Escape');
+            return false;
+        }
+    } catch (e) {
+        console.warn('[Gemini] Không thể đổi mô hình:', e.message);
+        return false;
+    }
+}
+
 // Hàm gửi câu hỏi và nhận câu trả lời từ Gemini
-async function askGemini(prompt) {
+async function askGemini(prompt, options = {}) {
+    const { newChat = false, maxWaitSeconds = 180, model = 'Flash' } = options;
     const page = await getGeminiPage();
 
-    console.log(`[Gemini] Đang gửi prompt: "${prompt.slice(0, 80)}${prompt.length > 80 ? '...' : ''}"`);
+    if (newChat) {
+        console.log('[Gemini] Đang mở cuộc trò chuyện mới...');
+        await page.goto('https://gemini.google.com/app', { waitUntil: 'domcontentloaded' });
+        await page.waitForSelector('div.ql-editor, div[contenteditable="true"]', { timeout: 30000 });
+        await page.waitForTimeout(800);
+    }
+
+    // Đảm bảo đang chọn đúng mô hình yêu cầu (mặc định là Gemini Flash)
+    await ensureModel(page, model);
+
+    console.log(`[Gemini] Đang gửi nội dung (${prompt.length} ký tự)...`);
     const prevCount = await page.locator('model-response').count();
 
     // 1. Nhập prompt vào ô chat
-    const input = page.locator('div[contenteditable="true"]').first();
+    const input = page.locator('div.ql-editor, div[contenteditable="true"]').first();
     await input.click();
     await input.fill(prompt);
-    await page.waitForTimeout(300);
+    await page.waitForTimeout(500);
 
     // 2. Click nút gửi hoặc ấn Enter
-    const sendBtn = page.locator('button[aria-label*="Gửi tin nhắn"], button[aria-label*="Send message"]').first();
+    const sendBtn = page.locator('button[aria-label*="Gửi tin nhắn"], button[aria-label*="Send message"], button[aria-label="Gửi"]').first();
     if (await sendBtn.isVisible()) {
         await sendBtn.click();
     } else {
         await page.keyboard.press('Enter');
     }
 
+    console.log('[Gemini] Đã gửi lệnh, đang chờ phản hồi từ mô hình...');
+
     // 3. Chờ có model-response mới xuất hiện
     await page.waitForFunction((prev) => {
         return document.querySelectorAll('model-response').length > prev;
-    }, prevCount, { timeout: 35000 });
+    }, prevCount, { timeout: 45000 });
 
-    // 4. Chờ cho đến khi Gemini trả lời xong
+    console.log('[Gemini] Mô hình đang sinh câu trả lời...');
+
+    // 4. Chờ cho đến khi Gemini hoàn thành câu trả lời
     let lastText = '';
     let stableCount = 0;
-    const maxWaitSeconds = 90; // tối đa 90 giây cho câu trả lời dài
 
     for (let i = 0; i < maxWaitSeconds; i++) {
         await page.waitForTimeout(1000);
@@ -160,17 +234,27 @@ async function processQueue() {
     if (isProcessing || queue.length === 0) return;
     isProcessing = true;
 
-    const { prompt, resolve, reject, startTime } = queue.shift();
+    const { prompt, options, resolve, reject, startTime } = queue.shift();
 
     try {
-        const result = await askGemini(prompt);
+        const result = await askGemini(prompt, options);
         const durationSec = ((Date.now() - startTime) / 1000).toFixed(1);
-        console.log(`[Gemini] Hoàn tất sau ${durationSec}s!`);
+        let parsedData = null;
+        try {
+            // Loại bỏ markdown code block nếu có ```json ... ```
+            const cleanText = result.response.replace(/```json/gi, '').replace(/```/g, '').trim();
+            parsedData = JSON.parse(cleanText);
+        } catch {
+            // Không phải pure JSON, giữ nguyên null
+        }
+
         resolve({
             success: true,
             prompt: result.query || prompt,
             response: result.response,
-            duration: `${durationSec}s`
+            data: parsedData,
+            duration: `${durationSec}s`,
+            timestamp: new Date().toISOString()
         });
     } catch (err) {
         console.error('[Gemini] Lỗi xử lý:', err.message);
@@ -182,10 +266,11 @@ async function processQueue() {
     }
 }
 
-function enqueuePrompt(prompt) {
+function enqueuePrompt(prompt, options = {}) {
     return new Promise((resolve, reject) => {
         queue.push({
             prompt,
+            options,
             resolve,
             reject,
             startTime: Date.now()
@@ -209,16 +294,31 @@ const server = http.createServer(async (req, res) => {
 
     const url = new URL(req.url, `http://${req.headers.host}`);
 
-    // Endpoint kiểm tra trạng thái
+    // Endpoint kiểm tra trạng thái & hướng dẫn n8n
     if (url.pathname === '/' || url.pathname === '/health') {
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
         res.end(
             JSON.stringify({
                 status: 'online',
-                service: 'Gemini Web Local API',
+                service: 'Gemini Bridge for n8n',
+                endpoints: {
+                    ask: {
+                        method: 'POST',
+                        url: '/ask',
+                        description: 'Gửi prompt + tài liệu JSON để lấy câu trả lời từ Gemini',
+                        exampleBody: {
+                            prompt: 'Phân tích tài liệu này thành testcase cho tôi',
+                            document: {
+                                module: 'Thanh toán vé',
+                                requirements: ['Xác nhận OTP', 'Giao dịch qua QR Fintwin']
+                            },
+                            newChat: true
+                        }
+                    }
+                },
                 queueLength: queue.length,
                 isProcessing
-            })
+            }, null, 2)
         );
         return;
     }
@@ -234,19 +334,54 @@ const server = http.createServer(async (req, res) => {
                     parsed = JSON.parse(body);
                 } catch {
                     res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
-                    res.end(JSON.stringify({ error: 'Body phải là JSON hợp lệ: {"prompt": "..."}' }));
+                    res.end(JSON.stringify({
+                        success: false,
+                        error: 'Body phải là JSON hợp lệ. Ví dụ: {"prompt": "...", "document": {...}}'
+                    }));
                     return;
                 }
 
-                const prompt = parsed.prompt || parsed.query || parsed.message;
-                if (!prompt || typeof prompt !== 'string') {
+                let prompt = parsed.prompt || parsed.query || parsed.message || '';
+                const documentData = parsed.document !== undefined ? parsed.document : (parsed.data !== undefined ? parsed.data : parsed.json);
+
+                if (!prompt && documentData === undefined) {
                     res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
-                    res.end(JSON.stringify({ error: 'Thiếu trường "prompt" trong JSON body.' }));
+                    res.end(JSON.stringify({
+                        success: false,
+                        error: 'Thiếu dữ liệu! Cần cung cấp ít nhất "prompt" hoặc "document" trong JSON body.'
+                    }));
                     return;
                 }
 
-                console.log(`\n[API] Nhận request mới từ n8n (Hàng đợi hiện tại: ${queue.length})`);
-                const result = await enqueuePrompt(prompt);
+                // Kết hợp prompt và tài liệu JSON thành một câu hỏi hoàn chỉnh cho Gemini
+                let fullPrompt = '';
+                if (typeof prompt === 'string' && prompt.trim()) {
+                    fullPrompt = prompt.trim();
+                }
+
+                if (documentData !== undefined && documentData !== null) {
+                    let formattedDoc = '';
+                    if (typeof documentData === 'object') {
+                        formattedDoc = JSON.stringify(documentData, null, 2);
+                    } else {
+                        formattedDoc = String(documentData);
+                    }
+
+                    if (fullPrompt) {
+                        fullPrompt += '\n\n--- DỮ LIỆU TÀI LIỆU (JSON) ---\n```json\n' + formattedDoc + '\n```';
+                    } else {
+                        fullPrompt = 'Dưới đây là tài liệu được định dạng JSON. Hãy phân tích và trích xuất thông tin theo yêu cầu:\n\n```json\n' + formattedDoc + '\n```';
+                    }
+                }
+
+                const options = {
+                    newChat: !!parsed.newChat,
+                    maxWaitSeconds: Number(parsed.timeout) || 180,
+                    model: parsed.model || 'Flash'
+                };
+
+                console.log(`\n[API] Nhận request mới từ n8n (Hàng đợi: ${queue.length + 1}, newChat: ${options.newChat})`);
+                const result = await enqueuePrompt(fullPrompt, options);
 
                 res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
                 res.end(JSON.stringify(result, null, 2));
@@ -268,17 +403,18 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify({ error: 'Not Found' }));
 });
 
-server.listen(PORT, async () => {
+server.listen(PORT, '0.0.0.0', async () => {
     console.log(`====================================================`);
-    console.log(`🚀 Gemini Web API Server đang chạy tại:`);
-    console.log(`👉 http://localhost:${PORT}`);
-    console.log(`👉 Endpoint cho n8n: POST http://localhost:${PORT}/ask`);
+    console.log(`🚀 Gemini Bridge for n8n đang chạy tại:`);
+    console.log(`👉 Local:     http://localhost:${PORT}`);
+    console.log(`👉 Cho n8n:   http://host.docker.internal:${PORT}/ask`);
+    console.log(`👉 Tailscale: http://100.105.11.43:${PORT}/ask`);
     console.log(`====================================================`);
 
     // Khởi tạo kết nối sẵn sàng với Chrome
     try {
         await getGeminiPage();
-        console.log(`✓ Sẵn sàng nhận câu hỏi từ n8n!\n`);
+        console.log(`✓ Sẵn sàng nhận câu hỏi & tài liệu JSON từ n8n!\n`);
     } catch (e) {
         console.log(`! Chờ kết nối Chrome: ${e.message}\n`);
     }

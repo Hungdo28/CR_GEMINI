@@ -1,0 +1,101 @@
+{
+  "name": "Gemini - Gửi Prompt và Tài liệu JSON",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "e3e8f81a-6df7-464a-9b16-9c4c79f9a001",
+      "name": "Bấm chạy thử nghiệm (Manual Trigger)",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        200,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Chuẩn bị Prompt và Tài liệu đã chuyển thành JSON\n// Bạn có thể lấy tài liệu từ các node trước đó (Read PDF, Convert to JSON, Google Drive, v.v.)\n\nconst prompt = \"Phân tích tài liệu này thành bộ testcase chi tiết gồm: ID, Chức năng, Tiền điều kiện, Các bước thực hiện, Kết quả mong đợi, Phân loại (Positive/Negative).\";\n\nconst documentJson = {\n  \"document_name\": \"26082026_SRS_Thanh toán vé tháng quý qua FW_v1.0\",\n  \"version\": \"1.0\",\n  \"features\": [\n    {\n      \"module\": \"Thanh toán QR Fintwin\",\n      \"flow\": [\n        \"Hệ thống chuyển hướng sang webview thanh toán QR Fintwin\",\n        \"Khách hàng quét mã QR trên ứng dụng ngân hàng\",\n        \"Xử lý IPN thành công, đồng bộ OCS (CHARGE_METHOD_SELECT = 7)\",\n        \"Hiển thị thông báo mua vé thành công trên App/Web CPT ePass\"\n      ],\n      \"exceptions\": [\n        \"Hết thời gian quét QR (Timeout 15 phút)\",\n        \"Giao dịch thất bại do số dư không đủ\",\n        \"Mất kết nối mạng trong quá trình gọi IPN\"\n      ]\n    }\n  ]\n};\n\nreturn [{\n  json: {\n    prompt: prompt,\n    document: documentJson,\n    newChat: true\n  }\n}];"
+      },
+      "id": "b1b2c3d4-0001-4000-8000-000000000001",
+      "name": "Chuẩn bị Prompt & Tài liệu JSON",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        440,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://localhost:3000/ask",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"prompt\": {{ JSON.stringify($json.prompt) }},\n  \"document\": {{ JSON.stringify($json.document) }},\n  \"newChat\": {{ $json.newChat || true }}\n}",
+        "options": {
+          "timeout": 180000
+        }
+      },
+      "id": "c2c3d4e5-0002-4000-8000-000000000002",
+      "name": "Gửi sang Gemini API Server",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        680,
+        300
+      ],
+      "notes": "LƯU Ý: Nếu n8n chạy trong Docker, hãy đổi URL thành: http://host.docker.internal:3000/ask"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Trích xuất nội dung câu trả lời từ Gemini\nconst geminiResult = $input.first().json;\n\nreturn [{\n  json: {\n    success: geminiResult.success,\n    duration: geminiResult.duration,\n    testcase_response: geminiResult.response,\n    timestamp: geminiResult.timestamp\n  }\n}];"
+      },
+      "id": "d3d4e5f6-0003-4000-8000-000000000003",
+      "name": "Xử lý kết quả trả về",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        920,
+        300
+      ]
+    }
+  ],
+  "connections": {
+    "Bấm chạy thử nghiệm (Manual Trigger)": {
+      "main": [
+        [
+          {
+            "node": "Chuẩn bị Prompt & Tài liệu JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Chuẩn bị Prompt & Tài liệu JSON": {
+      "main": [
+        [
+          {
+            "node": "Gửi sang Gemini API Server",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gửi sang Gemini API Server": {
+      "main": [
+        [
+          {
+            "node": "Xử lý kết quả trả về",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}
